@@ -49,7 +49,9 @@ app.get('/', (_req, res) => {
       background: #0b1020;
       font-family: Arial, sans-serif;
     }
-    canvas { display: block; }
+    canvas {
+      display: block;
+    }
     #hud {
       position: fixed;
       top: 12px;
@@ -382,5 +384,5 @@ setInterval(() => {
 }, BROADCAST_MS);
 
 server.listen(PORT, () => {
-console.log(`Server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
