@@ -1,939 +1,722 @@
+const express = require('express');
 const http = require('http');
-const WebSocket = require('ws');
-const { URL } = require('url');
+const { Server } = require('socket.io');
 
-const PORT = process.env.PORT || 8080;
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  transports: ['websocket', 'polling'],
+  cors: {
+    origin: '*',
+  },
+});
 
-const rooms = new Map(); // roomCode -> room
-const clients = new Map(); // ws -> { id, roomCode, name }
+const PORT = process.env.PORT || 3000;
+const TICK_RATE = 45;
+const ARENA_SIZE = 40;
+const HALF_ARENA = ARENA_SIZE / 2;
+const PLAYER_SPEED = 0.18;
 
-function makeId() {
-  return Math.random().toString(36).slice(2, 10);
-}
+const players = new Map();
 
-function makeRoomCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 6; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return code;
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
 function randomSpawn() {
+  const padding = 3;
   return {
-    x: 100 + Math.random() * 1000,
-    y: 100 + Math.random() * 600
+    x: (Math.random() * (ARENA_SIZE - padding * 2)) - (ARENA_SIZE / 2 - padding),
+    y: 0.5,
+    z: (Math.random() * (ARENA_SIZE - padding * 2)) - (ARENA_SIZE / 2 - padding),
   };
 }
 
-function clamp(v, min, max) {
-  return Math.max(min, Math.min(max, v));
+function randomColor() {
+  const hue = Math.floor(Math.random() * 360);
+  return `hsl(${hue}, 80%, 60%)`;
 }
 
-function safeSend(ws, data) {
+io.on('connection', (socket) => {
   try {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(data));
-    }
-  } catch {}
-}
+    const spawn = randomSpawn();
+    const player = {
+      id: socket.id,
+      x: spawn.x,
+      y: spawn.y,
+      z: spawn.z,
+      rotationY: 0,
+      color: randomColor(),
+      name: `Player-${socket.id.slice(0, 4)}`,
+      lastInputSeq: 0,
+    };
 
-function broadcastRoom(roomCode, data) {
-  const room = rooms.get(roomCode);
-  if (!room) return;
-  for (const client of room.clients) {
-    safeSend(client.ws, data);
-  }
-}
+    players.set(socket.id, player);
 
-function roomState(room) {
-  return {
-    type: 'roomState',
-    roomCode: room.code,
-    players: Object.values(room.players),
-    bullets: room.bullets
-  };
-}
-
-function createRoom() {
-  let code = makeRoomCode();
-  while (rooms.has(code)) code = makeRoomCode();
-
-  const room = {
-    code,
-    clients: [],
-    players: {}, // id -> player
-    bullets: [],
-    lastBulletId: 0
-  };
-  rooms.set(code, room);
-  return room;
-}
-
-function removeClientFromRoom(ws) {
-  const info = clients.get(ws);
-  if (!info) return;
-
-  const room = rooms.get(info.roomCode);
-  if (room) {
-    room.clients = room.clients.filter(c => c.ws !== ws);
-    delete room.players[info.id];
-
-    broadcastRoom(room.code, {
-      type: 'playerLeft',
-      id: info.id
+    socket.emit('init', {
+      id: socket.id,
+      arenaSize: ARENA_SIZE,
+      player,
+      players: Object.fromEntries(players),
+      serverTickRate: TICK_RATE,
+      speed: PLAYER_SPEED,
     });
 
-    broadcastRoom(room.code, roomState(room));
+    socket.broadcast.emit('playerJoined', player);
 
-    if (room.clients.length === 0) {
-      rooms.delete(room.code);
-    }
-  }
+    socket.on('move', (payload = {}) => {
+      try {
+        const p = players.get(socket.id);
+        if (!p) return;
 
-  clients.delete(ws);
-}
+        const x = Number(payload.x);
+        const y = Number(payload.y);
+        const z = Number(payload.z);
+        const rotationY = Number(payload.rotationY);
+        const lastInputSeq = Number(payload.lastInputSeq || 0);
 
-function joinRoom(ws, roomCode, name) {
-  const room = rooms.get(roomCode);
-  if (!room) {
-    safeSend(ws, { type: 'errorMessage', message: 'Room not found.' });
-    return;
-  }
-
-  const id = makeId();
-  const spawn = randomSpawn();
-
-  const player = {
-    id,
-    name: String(name || 'Player').slice(0, 16),
-    x: spawn.x,
-    y: spawn.y,
-    vx: 0,
-    vy: 0,
-    angle: 0,
-    hp: 100,
-    alive: true,
-    color: `hsl(${Math.floor(Math.random() * 360)}deg 90% 60%)`,
-    kills: 0,
-    deaths: 0
-  };
-
-  room.players[id] = player;
-  room.clients.push({ ws, id });
-
-  clients.set(ws, {
-    id,
-    roomCode: room.code,
-    name: player.name
-  });
-
-  safeSend(ws, {
-    type: 'joined',
-    id,
-    roomCode: room.code,
-    player
-  });
-
-  broadcastRoom(room.code, roomState(room));
-}
-
-function createAndJoinRoom(ws, name) {
-  const room = createRoom();
-  joinRoom(ws, room.code, name);
-}
-
-function respawnPlayer(room, playerId) {
-  const p = room.players[playerId];
-  if (!p) return;
-  const spawn = randomSpawn();
-  p.x = spawn.x;
-  p.y = spawn.y;
-  p.vx = 0;
-  p.vy = 0;
-  p.hp = 100;
-  p.alive = true;
-  broadcastRoom(room.code, {
-    type: 'respawn',
-    player: p
-  });
-}
-
-function tickRooms() {
-  const now = Date.now();
-
-  for (const room of rooms.values()) {
-    // Update bullets
-    for (const b of room.bullets) {
-      b.x += b.vx;
-      b.y += b.vy;
-      b.life -= 1;
-    }
-
-    // Bullet collisions + cleanup
-    const survivors = [];
-    for (const b of room.bullets) {
-      let hit = false;
-
-      if (b.life <= 0 || b.x < 0 || b.y < 0 || b.x > 1200 || b.y > 800) {
-        continue;
-      }
-
-      for (const p of Object.values(room.players)) {
-        if (!p.alive) continue;
-        if (p.id === b.ownerId) continue;
-
-        const dx = p.x - b.x;
-        const dy = p.y - b.y;
-        const dist2 = dx * dx + dy * dy;
-        const r = 18;
-
-        if (dist2 <= r * r) {
-          p.hp -= 25;
-          hit = true;
-
-          broadcastRoom(room.code, {
-            type: 'hit',
-            targetId: p.id,
-            hp: p.hp,
-            x: b.x,
-            y: b.y
-          });
-
-          if (p.hp <= 0) {
-            p.alive = false;
-            p.hp = 0;
-            p.deaths += 1;
-
-            const killer = room.players[b.ownerId];
-            if (killer) killer.kills += 1;
-
-            broadcastRoom(room.code, {
-              type: 'died',
-              victimId: p.id,
-              killerId: b.ownerId
-            });
-
-            setTimeout(() => {
-              const stillRoom = rooms.get(room.code);
-              if (!stillRoom) return;
-              respawnPlayer(stillRoom, p.id);
-            }, 2000);
-          }
-
-          break;
+        if (
+          Number.isNaN(x) ||
+          Number.isNaN(y) ||
+          Number.isNaN(z) ||
+          Number.isNaN(rotationY)
+        ) {
+          return;
         }
-      }
 
-      if (!hit) survivors.push(b);
+        const boundary = HALF_ARENA - 0.6;
+
+        p.x = clamp(x, -boundary, boundary);
+        p.y = 0.5;
+        p.z = clamp(z, -boundary, boundary);
+        p.rotationY = rotationY;
+        p.lastInputSeq = lastInputSeq;
+      } catch (err) {
+        console.error('Move handler error:', err);
+      }
+    });
+
+    socket.on('disconnect', () => {
+      try {
+        players.delete(socket.id);
+        io.emit('playerLeft', socket.id);
+      } catch (err) {
+        console.error('Disconnect handler error:', err);
+      }
+    });
+
+    socket.on('error', (err) => {
+      console.error(`Socket error from ${socket.id}:`, err);
+    });
+  } catch (err) {
+    console.error('Connection setup error:', err);
+    socket.disconnect(true);
+  }
+});
+
+setInterval(() => {
+  try {
+    const snapshot = {};
+    for (const [id, player] of players.entries()) {
+      snapshot[id] = {
+        id: player.id,
+        x: player.x,
+        y: player.y,
+        z: player.z,
+        rotationY: player.rotationY,
+        color: player.color,
+        name: player.name,
+        lastInputSeq: player.lastInputSeq,
+      };
     }
 
-    room.bullets = survivors;
-
-    // Broadcast state frequently
-    broadcastRoom(room.code, {
-      type: 'state',
-      players: Object.values(room.players),
-      bullets: room.bullets,
-      serverTime: now
+    io.emit('state', {
+      time: Date.now(),
+      players: snapshot,
     });
+  } catch (err) {
+    console.error('Broadcast error:', err);
   }
-}
+}, TICK_RATE);
 
-setInterval(tickRooms, 1000 / 30);
-
-const html = `<!DOCTYPE html>
+app.get('/', (_req, res) => {
+  res.type('html').send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1.0" />
-<title>Multiplayer Shooter</title>
-<style>
-  :root{
-    --bg:#0A0A0B;
-    --panel:rgba(255,255,255,0.10);
-    --panel-2:rgba(255,255,255,0.07);
-    --border:rgba(255,255,255,0.18);
-    --cyan:#00F5FF;
-    --magenta:#FF00E5;
-    --text:#F5FBFF;
-    --muted:#AAB8C3;
-    --danger:#FF5577;
-    --good:#57FFA3;
-  }
-  *{box-sizing:border-box}
-  html,body{
-    margin:0;padding:0;background:radial-gradient(circle at top,#131319 0%,#0A0A0B 55%);
-    color:var(--text);font-family:Inter,system-ui,Arial,sans-serif;height:100%;overflow:hidden
-  }
-  canvas{
-    display:block;width:100vw;height:100vh;background:
-      radial-gradient(circle at 20% 20%, rgba(0,245,255,.08), transparent 20%),
-      radial-gradient(circle at 80% 30%, rgba(255,0,229,.06), transparent 25%),
-      linear-gradient(180deg,#101014,#080809);
-    cursor:crosshair;
-  }
-  .hud{
-    position:fixed;inset:16px auto auto 16px;display:flex;flex-direction:column;gap:10px;z-index:10;
-    max-width:min(92vw,380px);
-  }
-  .panel{
-    background:var(--panel);
-    backdrop-filter: blur(18px) saturate(180%);
-    border:1px solid var(--border);
-    border-radius:16px;
-    box-shadow:0 10px 35px rgba(0,0,0,.35);
-  }
-  .topbar{
-    padding:12px 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap
-  }
-  .title{
-    font-weight:800;letter-spacing:.04em;color:var(--cyan);text-shadow:0 0 16px rgba(0,245,255,.35)
-  }
-  .small{font-size:12px;color:var(--muted)}
-  .menu{
-    padding:14px;display:grid;gap:10px
-  }
-  .row{display:flex;gap:10px;flex-wrap:wrap}
-  input{
-    flex:1;min-width:120px;
-    background:var(--panel-2);color:var(--text);
-    border:1px solid var(--border);border-radius:12px;padding:12px 12px;outline:none
-  }
-  button{
-    background:linear-gradient(135deg, rgba(0,245,255,.18), rgba(255,0,229,.16));
-    color:var(--text);
-    border:1px solid rgba(255,255,255,.22);
-    border-radius:12px;padding:12px 14px;cursor:pointer;font-weight:700
-  }
-  button:hover{filter:brightness(1.08)}
-  button.secondary{
-    background:rgba(255,255,255,.07)
-  }
-  .status{
-    padding:10px 12px;border-radius:12px;background:rgba(255,255,255,.06);font-size:13px;color:var(--muted)
-  }
-  .roomLine{
-    display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap
-  }
-  .badge{
-    display:inline-flex;align-items:center;gap:8px;
-    padding:8px 10px;border-radius:999px;background:rgba(0,245,255,.12);
-    border:1px solid rgba(0,245,255,.25);color:var(--cyan);font-weight:800;letter-spacing:.1em
-  }
-  .score{
-    position:fixed;top:16px;right:16px;z-index:10;width:min(92vw,260px);padding:12px 14px
-  }
-  .score h3{margin:0 0 8px 0;font-size:14px;color:var(--muted)}
-  .board{display:grid;gap:6px;font-size:13px}
-  .entry{display:flex;justify-content:space-between;gap:8px}
-  .controls{
-    position:fixed;left:16px;bottom:16px;z-index:10;padding:10px 12px;font-size:12px;color:var(--muted)
-  }
-  .centerMsg{
-    position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);
-    z-index:11;padding:14px 18px;display:none
-  }
-  .show{display:block}
-  .accent{color:var(--magenta)}
-  @media (max-width:640px){
-    .score{top:auto;bottom:16px;right:16px}
-  }
-</style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Battle Arena</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #05070d;
+      font-family: Inter, Arial, sans-serif;
+      color: white;
+    }
+
+    #game {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .hud {
+      position: fixed;
+      top: 14px;
+      left: 14px;
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.38);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 12px;
+      padding: 12px 14px;
+      backdrop-filter: blur(8px);
+      box-shadow: 0 12px 30px rgba(0,0,0,0.25);
+      user-select: none;
+    }
+
+    .hud h1 {
+      margin: 0 0 8px 0;
+      font-size: 16px;
+      letter-spacing: 0.04em;
+    }
+
+    .hud p {
+      margin: 4px 0;
+      font-size: 13px;
+      opacity: 0.9;
+    }
+
+    .crosshair {
+      position: fixed;
+      left: 50%;
+      top: 50%;
+      width: 10px;
+      height: 10px;
+      transform: translate(-50%, -50%);
+      z-index: 9;
+      pointer-events: none;
+    }
+
+    .crosshair::before,
+    .crosshair::after {
+      content: "";
+      position: absolute;
+      background: rgba(255,255,255,0.8);
+      box-shadow: 0 0 8px rgba(255,255,255,0.35);
+    }
+
+    .crosshair::before {
+      width: 10px;
+      height: 2px;
+      top: 4px;
+      left: 0;
+    }
+
+    .crosshair::after {
+      width: 2px;
+      height: 10px;
+      top: 0;
+      left: 4px;
+    }
+
+    .status {
+      position: fixed;
+      right: 14px;
+      top: 14px;
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.38);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 12px;
+      padding: 10px 12px;
+      font-size: 13px;
+      backdrop-filter: blur(8px);
+    }
+  </style>
 </head>
 <body>
-<canvas id="game"></canvas>
-
-<div class="hud">
-  <div class="panel topbar">
-    <div class="title">CYBER SHOOTER</div>
-    <div class="small" id="connLabel">Disconnected</div>
+  <div class="hud">
+    <h1>Battle Arena</h1>
+    <p>Move: <strong>WASD</strong></p>
+    <p>Camera: auto-follow</p>
+    <p>Players sync every 45ms with interpolation</p>
   </div>
+  <div class="status" id="status">Connecting...</div>
+  <div class="crosshair"></div>
+  <canvas id="game"></canvas>
 
-  <div class="panel menu">
-    <div class="row">
-      <input id="nameInput" maxlength="16" placeholder="Your name" />
-    </div>
-    <div class="row">
-      <button id="createBtn">Create room</button>
-      <button id="leaveBtn" class="secondary">Leave</button>
-    </div>
-    <div class="row">
-      <input id="roomInput" maxlength="6" placeholder="Enter room code" />
-      <button id="joinBtn">Join room</button>
-    </div>
-    <div class="status" id="statusBox">Create a room or enter a code to join one.</div>
-    <div class="roomLine">
-      <div class="badge">ROOM <span id="roomCodeLabel">------</span></div>
-      <button id="copyBtn" class="secondary">Copy invite</button>
-    </div>
-  </div>
-</div>
+  <script src="/socket.io/socket.io.js"></script>
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
 
-<div class="panel score">
-  <h3>Scoreboard</h3>
-  <div class="board" id="scoreboard"></div>
-</div>
-
-<div class="panel controls">
-  WASD / Arrows = move · Mouse = aim · Click = shoot
-</div>
-
-<div class="panel centerMsg" id="centerMsg"></div>
-
-<script>
-(() => {
-  const canvas = document.getElementById('game');
-  const ctx = canvas.getContext('2d');
-
-  const connLabel = document.getElementById('connLabel');
-  const statusBox = document.getElementById('statusBox');
-  const roomCodeLabel = document.getElementById('roomCodeLabel');
-  const scoreboard = document.getElementById('scoreboard');
-  const centerMsg = document.getElementById('centerMsg');
-
-  const nameInput = document.getElementById('nameInput');
-  const roomInput = document.getElementById('roomInput');
-  const createBtn = document.getElementById('createBtn');
-  const joinBtn = document.getElementById('joinBtn');
-  const leaveBtn = document.getElementById('leaveBtn');
-  const copyBtn = document.getElementById('copyBtn');
-
-  const params = new URLSearchParams(location.search);
-  const prefillRoom = (params.get('room') || '').toUpperCase();
-  if (prefillRoom) roomInput.value = prefillRoom;
-  nameInput.value = localStorage.getItem('mp_name') || ('Player' + Math.floor(Math.random()*1000));
-
-  let ws = null;
-  let myId = null;
-  let myRoom = null;
-  let players = [];
-  let bullets = [];
-  let effects = [];
-  let keys = {};
-  let mouse = { x: 0, y: 0, down: false };
-  let camera = { x: 0, y: 0 };
-  let lastShot = 0;
-  let connected = false;
-
-  const WORLD = { w: 1200, h: 800 };
-
-  function setStatus(text) {
-    statusBox.textContent = text;
-  }
-
-  function flashMessage(text) {
-    centerMsg.textContent = text;
-    centerMsg.classList.add('show');
-    clearTimeout(flashMessage._t);
-    flashMessage._t = setTimeout(() => centerMsg.classList.remove('show'), 1400);
-  }
-
-  function resize() {
-    canvas.width = window.innerWidth * devicePixelRatio;
-    canvas.height = window.innerHeight * devicePixelRatio;
-    ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
-  }
-  resize();
-  window.addEventListener('resize', resize);
-
-  function wsUrl() {
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return proto + '//' + location.host + '/ws';
-  }
-
-  function connect() {
-    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-
-    ws = new WebSocket(wsUrl());
-
-    ws.addEventListener('open', () => {
-      connected = true;
-      connLabel.textContent = 'Connected';
-      connLabel.style.color = 'var(--good)';
-      setStatus('Connected. Create or join a room.');
+    const socket = io({
+      transports: ['websocket', 'polling']
     });
 
-    ws.addEventListener('close', () => {
-      connected = false;
-      connLabel.textContent = 'Disconnected';
-      connLabel.style.color = 'var(--danger)';
-      setStatus('Connection lost. Reconnecting...');
-      setTimeout(connect, 1000);
+    const canvas = document.getElementById('game');
+    const statusEl = document.getElementById('status');
+
+    const renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: true,
+      powerPreference: 'high-performance'
     });
 
-    ws.addEventListener('message', (ev) => {
-      const msg = JSON.parse(ev.data);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
 
-      if (msg.type === 'joined') {
-        myId = msg.id;
-        myRoom = msg.roomCode;
-        roomCodeLabel.textContent = myRoom;
-        setStatus('Joined room ' + myRoom);
-        history.replaceState({}, '', '/?room=' + encodeURIComponent(myRoom));
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x070b14);
+    scene.fog = new THREE.Fog(0x070b14, 20, 70);
+
+    const camera = new THREE.PerspectiveCamera(
+      70,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      200
+    );
+
+    const clock = new THREE.Clock();
+
+    let arenaSize = 40;
+    let myId = null;
+    let myPlayer = null;
+    let serverStateBuffer = [];
+    let sequence = 0;
+
+    const keyState = {
+      KeyW: false,
+      KeyA: false,
+      KeyS: false,
+      KeyD: false
+    };
+
+    const localInputs = [];
+    const remotePlayers = new Map();
+
+    const world = {
+      floor: null,
+      grid: null,
+      walls: []
+    };
+
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    function lerp(a, b, t) {
+      return a + (b - a) * t;
+    }
+
+    function createArena(size) {
+      const half = size / 2;
+
+      const floorGeo = new THREE.PlaneGeometry(size, size, 1, 1);
+      const floorMat = new THREE.MeshStandardMaterial({
+        color: 0x141a24,
+        metalness: 0.2,
+        roughness: 0.85
+      });
+
+      const floor = new THREE.Mesh(floorGeo, floorMat);
+      floor.rotation.x = -Math.PI / 2;
+      floor.receiveShadow = true;
+      scene.add(floor);
+      world.floor = floor;
+
+      const grid = new THREE.GridHelper(size, size, 0x7dd3fc, 0x334155);
+      grid.position.y = 0.01;
+      grid.material.opacity = 0.35;
+      grid.material.transparent = true;
+      scene.add(grid);
+      world.grid = grid;
+
+      const wallMat = new THREE.MeshStandardMaterial({
+        color: 0x1e293b,
+        metalness: 0.35,
+        roughness: 0.7,
+        emissive: 0x0b1220,
+        emissiveIntensity: 0.25
+      });
+
+      const thickness = 0.8;
+      const height = 2;
+
+      const wallData = [
+        { w: size + thickness * 2, h: height, d: thickness, x: 0, y: height / 2, z: -half - thickness / 2 },
+        { w: size + thickness * 2, h: height, d: thickness, x: 0, y: height / 2, z: half + thickness / 2 },
+        { w: thickness, h: height, d: size, x: -half - thickness / 2, y: height / 2, z: 0 },
+        { w: thickness, h: height, d: size, x: half + thickness / 2, y: height / 2, z: 0 }
+      ];
+
+      for (const wall of wallData) {
+        const mesh = new THREE.Mesh(
+          new THREE.BoxGeometry(wall.w, wall.h, wall.d),
+          wallMat
+        );
+        mesh.position.set(wall.x, wall.y, wall.z);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        scene.add(mesh);
+        world.walls.push(mesh);
+      }
+    }
+
+    function createLights() {
+      const ambient = new THREE.AmbientLight(0xaecbff, 0.4);
+      scene.add(ambient);
+
+      const dirLight = new THREE.DirectionalLight(0xffffff, 1.8);
+      dirLight.position.set(12, 18, 10);
+      dirLight.castShadow = true;
+      dirLight.shadow.mapSize.width = 2048;
+      dirLight.shadow.mapSize.height = 2048;
+      dirLight.shadow.camera.near = 0.5;
+      dirLight.shadow.camera.far = 80;
+      dirLight.shadow.camera.left = -30;
+      dirLight.shadow.camera.right = 30;
+      dirLight.shadow.camera.top = 30;
+      dirLight.shadow.camera.bottom = -30;
+      dirLight.shadow.bias = -0.0008;
+      scene.add(dirLight);
+
+      const rim = new THREE.DirectionalLight(0x60a5fa, 0.5);
+      rim.position.set(-10, 8, -12);
+      scene.add(rim);
+    }
+
+    function createPlayerMesh(color, isLocal = false) {
+      const group = new THREE.Group();
+
+      const body = new THREE.Mesh(
+        new THREE.BoxGeometry(1, 1, 1),
+        new THREE.MeshStandardMaterial({
+          color,
+          metalness: 0.3,
+          roughness: 0.45,
+          emissive: new THREE.Color(color).multiplyScalar(isLocal ? 0.15 : 0.08),
+          emissiveIntensity: 1
+        })
+      );
+      body.position.y = 0.5;
+      body.castShadow = true;
+      body.receiveShadow = true;
+      group.add(body);
+
+      const top = new THREE.Mesh(
+        new THREE.BoxGeometry(0.45, 0.18, 0.45),
+        new THREE.MeshStandardMaterial({
+          color: 0xffffff,
+          metalness: 0.1,
+          roughness: 0.6
+        })
+      );
+      top.position.set(0, 1.12, 0);
+      top.castShadow = true;
+      group.add(top);
+
+      const forwardMark = new THREE.Mesh(
+        new THREE.BoxGeometry(0.2, 0.2, 0.2),
+        new THREE.MeshStandardMaterial({
+          color: 0x111111,
+          metalness: 0.2,
+          roughness: 0.8
+        })
+      );
+      forwardMark.position.set(0, 0.65, 0.52);
+      group.add(forwardMark);
+
+      scene.add(group);
+      return group;
+    }
+
+    function addOrUpdateRemotePlayer(data) {
+      if (!data || data.id === myId) return;
+
+      let entry = remotePlayers.get(data.id);
+
+      if (!entry) {
+        const mesh = createPlayerMesh(data.color || '#ff00ff', false);
+        entry = {
+          mesh,
+          state: {
+            x: data.x,
+            y: data.y,
+            z: data.z,
+            rotationY: data.rotationY || 0
+          }
+        };
+        mesh.position.set(data.x, data.y || 0, data.z);
+        mesh.rotation.y = data.rotationY || 0;
+        remotePlayers.set(data.id, entry);
+      }
+    }
+
+    function removeRemotePlayer(id) {
+      const entry = remotePlayers.get(id);
+      if (!entry) return;
+      scene.remove(entry.mesh);
+      remotePlayers.delete(id);
+    }
+
+    function setupLocalPlayer(player) {
+      if (myPlayer && myPlayer.mesh) {
+        scene.remove(myPlayer.mesh);
       }
 
-      if (msg.type === 'roomState' || msg.type === 'state') {
-        players = msg.players || players;
-        bullets = msg.bullets || bullets;
-        updateBoard();
+      const mesh = createPlayerMesh(player.color, true);
+      mesh.position.set(player.x, player.y, player.z);
+      mesh.rotation.y = player.rotationY || 0;
+
+      myPlayer = {
+        id: player.id,
+        mesh,
+        position: new THREE.Vector3(player.x, player.y, player.z),
+        rotationY: player.rotationY || 0,
+        color: player.color,
+        speed: 8.2
+      };
+    }
+
+    function processMovement(delta) {
+      if (!myPlayer) return;
+
+      const move = new THREE.Vector3(
+        (keyState.KeyD ? 1 : 0) - (keyState.KeyA ? 1 : 0),
+        0,
+        (keyState.KeyS ? 1 : 0) - (keyState.KeyW ? 1 : 0)
+      );
+
+      if (move.lengthSq() <= 0) return;
+
+      move.normalize();
+
+      const scaledSpeed = myPlayer.speed * delta;
+      myPlayer.position.x += move.x * scaledSpeed;
+      myPlayer.position.z += move.z * scaledSpeed;
+
+      const boundary = arenaSize / 2 - 0.6;
+      myPlayer.position.x = clamp(myPlayer.position.x, -boundary, boundary);
+      myPlayer.position.z = clamp(myPlayer.position.z, -boundary, boundary);
+      myPlayer.position.y = 0.5;
+
+      myPlayer.rotationY = Math.atan2(move.x, move.z);
+
+      myPlayer.mesh.position.copy(myPlayer.position);
+      myPlayer.mesh.rotation.y = myPlayer.rotationY;
+
+      const input = {
+        seq: ++sequence,
+        x: myPlayer.position.x,
+        y: myPlayer.position.y,
+        z: myPlayer.position.z,
+        rotationY: myPlayer.rotationY,
+        dt: delta
+      };
+
+      localInputs.push(input);
+
+      socket.emit('move', {
+        x: input.x,
+        y: input.y,
+        z: input.z,
+        rotationY: input.rotationY,
+        lastInputSeq: input.seq
+      });
+    }
+
+    function reconcileWithServer(serverPlayer) {
+      if (!myPlayer || !serverPlayer) return;
+
+      const boundary = arenaSize / 2 - 0.6;
+
+      myPlayer.position.set(
+        clamp(serverPlayer.x, -boundary, boundary),
+        0.5,
+        clamp(serverPlayer.z, -boundary, boundary)
+      );
+      myPlayer.rotationY = serverPlayer.rotationY || 0;
+
+      while (localInputs.length && localInputs[0].seq <= (serverPlayer.lastInputSeq || 0)) {
+        localInputs.shift();
       }
 
-      if (msg.type === 'respawn') {
-        const i = players.findIndex(p => p.id === msg.player.id);
-        if (i >= 0) players[i] = msg.player;
-        else players.push(msg.player);
-        if (msg.player.id === myId) flashMessage('Respawned');
+      for (const input of localInputs) {
+        myPlayer.position.set(
+          clamp(input.x, -boundary, boundary),
+          0.5,
+          clamp(input.z, -boundary, boundary)
+        );
+        myPlayer.rotationY = input.rotationY;
       }
 
-      if (msg.type === 'hit') {
-        for (let i = 0; i < 10; i++) {
-          effects.push({
-            type: 'splat',
-            x: msg.x,
-            y: msg.y,
-            vx: (Math.random()-0.5)*3,
-            vy: (Math.random()-0.5)*3,
-            life: 20 + Math.random()*10,
-            color: '#FF5577'
-          });
+      myPlayer.mesh.position.copy(myPlayer.position);
+      myPlayer.mesh.rotation.y = myPlayer.rotationY;
+    }
+
+    function interpolateRemotePlayers(renderTime) {
+      if (serverStateBuffer.length < 2) return;
+
+      while (
+        serverStateBuffer.length >= 2 &&
+        serverStateBuffer[1].time <= renderTime
+      ) {
+        serverStateBuffer.shift();
+      }
+
+      const older = serverStateBuffer[0];
+      const newer = serverStateBuffer[1];
+
+      if (!older || !newer) return;
+
+      const span = newer.time - older.time;
+      const t = span > 0 ? (renderTime - older.time) / span : 0;
+
+      for (const [id, entry] of remotePlayers.entries()) {
+        const oldState = older.players[id];
+        const newState = newer.players[id];
+
+        if (!oldState && !newState) continue;
+
+        const from = oldState || newState;
+        const to = newState || oldState;
+
+        entry.mesh.position.set(
+          lerp(from.x, to.x, t),
+          lerp(from.y ?? 0.5, to.y ?? 0.5, t),
+          lerp(from.z, to.z, t)
+        );
+
+        entry.mesh.rotation.y = lerp(
+          from.rotationY || 0,
+          to.rotationY || 0,
+          t
+        );
+      }
+    }
+
+    function updateCamera(delta) {
+      if (!myPlayer) return;
+
+      const targetOffset = new THREE.Vector3(0, 9, 9);
+      const desired = myPlayer.position.clone().add(targetOffset);
+
+      camera.position.lerp(desired, Math.min(1, 6 * delta));
+      camera.lookAt(
+        myPlayer.position.x,
+        myPlayer.position.y + 0.5,
+        myPlayer.position.z
+      );
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = Math.min(clock.getDelta(), 0.05);
+      processMovement(delta);
+
+      const renderDelay = 100;
+      const renderTime = Date.now() - renderDelay;
+      interpolateRemotePlayers(renderTime);
+
+      updateCamera(delta);
+      renderer.render(scene, camera);
+    }
+
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    }
+
+    window.addEventListener('resize', onResize, { passive: true });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code in keyState) keyState[e.code] = true;
+    });
+
+    window.addEventListener('keyup', (e) => {
+      if (e.code in keyState) keyState[e.code] = false;
+    });
+
+    socket.on('connect', () => {
+      statusEl.textContent = 'Connected';
+    });
+
+    socket.on('disconnect', () => {
+      statusEl.textContent = 'Disconnected';
+    });
+
+    socket.on('connect_error', (err) => {
+      console.error('Socket connection error:', err);
+      statusEl.textContent = 'Connection error';
+    });
+
+    socket.on('init', (data) => {
+      myId = data.id;
+      arenaSize = data.arenaSize || 40;
+
+      createArena(arenaSize);
+      createLights();
+
+      setupLocalPlayer(data.player);
+
+      const allPlayers = data.players || {};
+      for (const id of Object.keys(allPlayers)) {
+        if (id !== myId) {
+          addOrUpdateRemotePlayer(allPlayers[id]);
         }
       }
 
-      if (msg.type === 'died') {
-        if (msg.victimId === myId) flashMessage('You died');
-      }
-
-      if (msg.type === 'playerLeft') {
-        players = players.filter(p => p.id !== msg.id);
-        updateBoard();
-      }
-
-      if (msg.type === 'errorMessage') {
-        setStatus(msg.message || 'Server error');
-        flashMessage(msg.message || 'Error');
-      }
-    });
-  }
-
-  connect();
-
-  function send(data) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify(data));
-  }
-
-  function getName() {
-    const n = (nameInput.value || 'Player').trim().slice(0, 16);
-    localStorage.setItem('mp_name', n);
-    return n || 'Player';
-  }
-
-  createBtn.onclick = () => {
-    connect();
-    send({ type: 'createRoom', name: getName() });
-  };
-
-  joinBtn.onclick = () => {
-    const code = roomInput.value.trim().toUpperCase();
-    if (!code) return setStatus('Enter a room code first.');
-    connect();
-    send({ type: 'joinRoom', roomCode: code, name: getName() });
-  };
-
-  leaveBtn.onclick = () => {
-    if (ws) ws.close();
-    myId = null;
-    myRoom = null;
-    players = [];
-    bullets = [];
-    roomCodeLabel.textContent = '------';
-    history.replaceState({}, '', '/');
-    flashMessage('Left room');
-  };
-
-  copyBtn.onclick = async () => {
-    if (!myRoom) return setStatus('No room yet.');
-    const url = location.origin + '/?room=' + encodeURIComponent(myRoom);
-    try {
-      await navigator.clipboard.writeText(url);
-      flashMessage('Invite copied');
-    } catch {
-      setStatus(url);
-    }
-  };
-
-  document.addEventListener('keydown', e => keys[e.key.toLowerCase()] = true);
-  document.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
-
-  canvas.addEventListener('mousemove', e => {
-    mouse.x = e.clientX;
-    mouse.y = e.clientY;
-  });
-  canvas.addEventListener('mousedown', () => mouse.down = true);
-  window.addEventListener('mouseup', () => mouse.down = false);
-
-  function me() {
-    return players.find(p => p.id === myId);
-  }
-
-  function updateBoard() {
-    const sorted = [...players].sort((a,b) => (b.kills - a.kills) || (a.deaths - b.deaths));
-    scoreboard.innerHTML = sorted.map(p => {
-      const isMe = p.id === myId;
-      return '<div class="entry">' +
-        '<span style="color:' + p.color + ';font-weight:700">' + (isMe ? 'You' : escapeHtml(p.name)) + '</span>' +
-        '<span>' + p.kills + ' / ' + p.deaths + ' · ' + p.hp + 'hp</span>' +
-      '</div>';
-    }).join('');
-  }
-
-  function escapeHtml(s) {
-    return String(s)
-      .replaceAll('&','&')
-      .replaceAll('<','<')
-      .replaceAll('>','>')
-      .replaceAll('"','"');
-  }
-
-  function worldToScreen(x, y) {
-    return {
-      x: x - camera.x + window.innerWidth / 2,
-      y: y - camera.y + window.innerHeight / 2
-    };
-  }
-
-  function screenToWorld(x, y) {
-    return {
-      x: x + camera.x - window.innerWidth / 2,
-      y: y + camera.y - window.innerHeight / 2
-    };
-  }
-
-  function shoot() {
-    const p = me();
-    if (!p || !p.alive || !myRoom) return;
-    const now = performance.now();
-    if (now - lastShot < 180) return;
-    lastShot = now;
-
-    const target = screenToWorld(mouse.x, mouse.y);
-    const dx = target.x - p.x;
-    const dy = target.y - p.y;
-    const len = Math.hypot(dx, dy) || 1;
-    const dirx = dx / len;
-    const diry = dy / len;
-
-    send({
-      type: 'shoot',
-      x: p.x + dirx * 24,
-      y: p.y + diry * 24,
-      vx: dirx * 10,
-      vy: diry * 10
+      camera.position.set(0, 10, 10);
+      camera.lookAt(0, 0, 0);
     });
 
-    for (let i = 0; i < 8; i++) {
-      effects.push({
-        type: 'muzzle',
-        x: p.x + dirx * 22,
-        y: p.y + diry * 22,
-        vx: dirx * (1 + Math.random()*2) + (Math.random()-0.5)*2,
-        vy: diry * (1 + Math.random()*2) + (Math.random()-0.5)*2,
-        life: 10 + Math.random()*6,
-        color: '#00F5FF'
-      });
-    }
-  }
-
-  function updateInput() {
-    const p = me();
-    if (!p || !p.alive) return;
-
-    let mx = 0, my = 0;
-    if (keys['w'] || keys['arrowup']) my -= 1;
-    if (keys['s'] || keys['arrowdown']) my += 1;
-    if (keys['a'] || keys['arrowleft']) mx -= 1;
-    if (keys['d'] || keys['arrowright']) mx += 1;
-
-    const len = Math.hypot(mx, my) || 1;
-    mx /= len; my /= len;
-
-    const aim = screenToWorld(mouse.x, mouse.y);
-    const angle = Math.atan2(aim.y - p.y, aim.x - p.x);
-
-    send({
-      type: 'input',
-      mx, my, angle
+    socket.on('playerJoined', (player) => {
+      addOrUpdateRemotePlayer(player);
     });
 
-    if (mouse.down) shoot();
-  }
+    socket.on('playerLeft', (id) => {
+      removeRemotePlayer(id);
+    });
 
-  function drawGrid() {
-    const step = 80;
-    ctx.save();
-    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
-    ctx.lineWidth = 1;
+    socket.on('state', (snapshot) => {
+      if (!snapshot || !snapshot.players) return;
 
-    const startX = -((camera.x - window.innerWidth/2) % step);
-    const startY = -((camera.y - window.innerHeight/2) % step);
+      serverStateBuffer.push(snapshot);
 
-    for (let x = startX; x < window.innerWidth; x += step) {
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, window.innerHeight);
-      ctx.stroke();
-    }
+      if (serverStateBuffer.length > 20) {
+        serverStateBuffer.shift();
+      }
 
-    for (let y = startY; y < window.innerHeight; y += step) {
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(window.innerWidth, y);
-      ctx.stroke();
-    }
-    ctx.restore();
-  }
+      for (const id of Object.keys(snapshot.players)) {
+        if (id === myId) continue;
+        addOrUpdateRemotePlayer(snapshot.players[id]);
+      }
 
-  function drawWorldBounds() {
-    const a = worldToScreen(0, 0);
-    const b = worldToScreen(WORLD.w, WORLD.h);
-    ctx.save();
-    ctx.strokeStyle = 'rgba(0,245,255,0.25)';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(a.x, a.y, b.x - a.x, b.y - a.y);
-    ctx.restore();
-  }
+      for (const [id] of remotePlayers.entries()) {
+        if (!snapshot.players[id]) {
+          removeRemotePlayer(id);
+        }
+      }
 
-  function drawPlayers() {
-    for (const p of players) {
-      const s = worldToScreen(p.x, p.y);
+      if (myId && snapshot.players[myId]) {
+        reconcileWithServer(snapshot.players[myId]);
+      }
+    });
 
-      ctx.save();
-      ctx.translate(s.x, s.y);
-
-      const isMe = p.id === myId;
-
-      ctx.globalAlpha = p.alive ? 1 : 0.35;
-
-      ctx.shadowBlur = 18;
-      ctx.shadowColor = p.color;
-
-      // body
-      ctx.fillStyle = p.color;
-      ctx.beginPath();
-      ctx.arc(0, 0, 18, 0, Math.PI * 2);
-      ctx.fill();
-
-      // gun
-      ctx.rotate(p.angle || 0);
-      ctx.fillStyle = '#dffcff';
-      ctx.fillRect(6, -4, 20, 8);
-
-      ctx.restore();
-
-      // hp bar
-      ctx.save();
-      ctx.fillStyle = 'rgba(255,255,255,.10)';
-      ctx.fillRect(s.x - 22, s.y - 34, 44, 6);
-      ctx.fillStyle = p.hp > 40 ? '#57FFA3' : '#FF5577';
-      ctx.fillRect(s.x - 22, s.y - 34, 44 * (p.hp / 100), 6);
-
-      ctx.font = '12px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillStyle = isMe ? '#00F5FF' : '#ffffff';
-      ctx.fillText(isMe ? 'YOU' : p.name, s.x, s.y - 42);
-      ctx.restore();
-    }
-  }
-
-  function drawBullets() {
-    for (const b of bullets) {
-      const s = worldToScreen(b.x, b.y);
-      ctx.save();
-      ctx.shadowBlur = 16;
-      ctx.shadowColor = '#FF00E5';
-      ctx.fillStyle = '#FF00E5';
-      ctx.beginPath();
-      ctx.arc(s.x, s.y, 4, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-    }
-  }
-
-  function drawEffects() {
-    for (const fx of effects) {
-      fx.x += fx.vx;
-      fx.y += fx.vy;
-      fx.life -= 1;
-      const s = worldToScreen(fx.x, fx.y);
-
-      ctx.save();
-      ctx.globalAlpha = Math.max(0, fx.life / 18);
-      ctx.shadowBlur = 18;
-      ctx.shadowColor = fx.color;
-      ctx.fillStyle = fx.color;
-      ctx.beginPath();
-      ctx.arc(s.x, s.y, fx.type === 'muzzle' ? 3 : 2.5, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-    }
-    effects = effects.filter(f => f.life > 0);
-  }
-
-  function drawMinHud() {
-    const p = me();
-    if (!p) return;
-    ctx.save();
-    ctx.fillStyle = 'rgba(0,0,0,0.35)';
-    ctx.fillRect(20, window.innerHeight - 42, 220, 16);
-    ctx.fillStyle = p.hp > 40 ? '#57FFA3' : '#FF5577';
-    ctx.fillRect(20, window.innerHeight - 42, 220 * (p.hp / 100), 16);
-    ctx.strokeStyle = 'rgba(255,255,255,.18)';
-    ctx.strokeRect(20, window.innerHeight - 42, 220, 16);
-    ctx.fillStyle = '#fff';
-    ctx.font = '12px sans-serif';
-    ctx.fillText('HP ' + p.hp, 24, window.innerHeight - 48);
-    ctx.restore();
-  }
-
-  function loop() {
-    requestAnimationFrame(loop);
-    updateInput();
-
-    const p = me();
-    if (p) {
-      camera.x += (p.x - camera.x) * 0.18;
-      camera.y += (p.y - camera.y) * 0.18;
-    }
-
-    ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
-    drawGrid();
-    drawWorldBounds();
-    drawBullets();
-    drawPlayers();
-    drawEffects();
-    drawMinHud();
-  }
-  loop();
-})();
-</script>
+    animate();
+  </script>
 </body>
-</html>`;
-
-const server = http.createServer((req, res) => {
-  const url = new URL(req.url, \`http://\${req.headers.host}\`);
-
-  if (url.pathname === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      ok: true,
-      rooms: rooms.size,
-      uptime: process.uptime()
-    }));
-    return;
-  }
-
-  if (url.pathname === '/') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(html);
-    return;
-  }
-
-  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('404 Not Found');
+</html>`);
 });
 
-const wss = new WebSocket.Server({ noServer: true });
-
-server.on('upgrade', (req, socket, head) => {
-  const url = new URL(req.url, \`http://\${req.headers.host}\`);
-  if (url.pathname !== '/ws') {
-    socket.destroy();
-    return;
-  }
-
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit('connection', ws, req);
-  });
-});
-
-wss.on('connection', (ws) => {
-  safeSend(ws, { type: 'hello', message: 'connected' });
-
-  ws.on('message', (buf) => {
-    let msg;
-    try {
-      msg = JSON.parse(buf.toString());
-    } catch {
-      return;
-    }
-
-    if (!msg || typeof msg !== 'object') return;
-
-    if (msg.type === 'createRoom') {
-      removeClientFromRoom(ws);
-      createAndJoinRoom(ws, msg.name || 'Player');
-      return;
-    }
-
-    if (msg.type === 'joinRoom') {
-      removeClientFromRoom(ws);
-      const code = String(msg.roomCode || '').toUpperCase();
-      joinRoom(ws, code, msg.name || 'Player');
-      return;
-    }
-
-    const info = clients.get(ws);
-    if (!info) return;
-
-    const room = rooms.get(info.roomCode);
-    if (!room) return;
-
-    const player = room.players[info.id];
-    if (!player) return;
-
-    if (msg.type === 'input') {
-      if (!player.alive) return;
-
-      const speed = 4;
-      const mx = clamp(Number(msg.mx) || 0, -1, 1);
-      const my = clamp(Number(msg.my) || 0, -1, 1);
-
-      player.vx = mx * speed;
-      player.vy = my * speed;
-      player.x = clamp(player.x + player.vx, 18, 1200 - 18);
-      player.y = clamp(player.y + player.vy, 18, 800 - 18);
-      player.angle = Number(msg.angle) || 0;
-      return;
-    }
-
-    if (msg.type === 'shoot') {
-      if (!player.alive) return;
-
-      room.lastBulletId += 1;
-      room.bullets.push({
-        id: room.lastBulletId,
-        ownerId: player.id,
-        x: Number(msg.x) || player.x,
-        y: Number(msg.y) || player.y,
-        vx: clamp(Number(msg.vx) || 0, -20, 20),
-        vy: clamp(Number(msg.vy) || 0, -20, 20),
-        life: 70
-      });
-      return;
-    }
-  });
-
-  ws.on('close', () => {
-    removeClientFromRoom(ws);
-  });
-
-  ws.on('error', () => {
-    removeClientFromRoom(ws);
-  });
-});
-
-server.listen(PORT, '0.0.0.0', () => {
-  console.log('Server running on port', PORT);
+server.listen(PORT, () => {
+  console.log(\`Battle Arena server running on port \${PORT}\`);
 });
