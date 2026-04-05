@@ -23,508 +23,564 @@ function makeRoomCode() {
   for (let i = 0; i < 6; i++) {
     code += chars[Math.floor(Math.random() * chars.length)];
   }
-  return code;
+  return rooms.has(code) ? makeRoomCode() : code;
 }
 
-function getOrCreateRoom(code) {
-  if (!rooms.has(code)) {
-    rooms.set(code, {
-      code,
-      players: new Map(),
-      bullets: [],
-      lastBulletId: 1
-    });
+function safeSend(ws, data) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(data));
   }
-  return rooms.get(code);
 }
 
-function sanitizePlayer(p) {
-  return {
-    id: p.id,
-    name: p.name || 'Player',
-    x: Number.isFinite(p.x) ? p.x : 200,
-    y: Number.isFinite(p.y) ? p.y : 200,
-    angle: Number.isFinite(p.angle) ? p.angle : 0,
-    hp: Number.isFinite(p.hp) ? p.hp : 100,
-    color: p.color || '#00F5FF'
-  };
+function broadcastRoom(roomCode, data, exceptWs = null) {
+  const room = rooms.get(roomCode);
+  if (!room) return;
+  for (const playerId of room.players.keys()) {
+    const client = [...clients.values()].find(c => c.playerId === playerId && c.roomCode === roomCode);
+    if (client && client.ws !== exceptWs) {
+      safeSend(client.ws, data);
+    }
+  }
 }
 
-function roomState(room) {
+function roomSnapshot(room) {
   return {
-    type: 'state',
     roomCode: room.code,
-    players: Array.from(room.players.values()).map(sanitizePlayer),
+    players: Array.from(room.players.values()),
     bullets: room.bullets
   };
 }
 
-function broadcastRoom(room, payload) {
-  const data = JSON.stringify(payload);
-  for (const player of room.players.values()) {
-    if (player.ws && player.ws.readyState === WebSocket.OPEN) {
-      player.ws.send(data);
-    }
-  }
+function createRoom() {
+  const code = makeRoomCode();
+  const room = {
+    code,
+    players: new Map(),
+    bullets: [],
+    lastBulletId: 1
+  };
+  rooms.set(code, room);
+  return room;
 }
 
-function removePlayer(ws) {
-  const meta = clients.get(ws);
-  if (!meta) return;
-
-  const { roomCode, playerId } = meta;
-  const room = rooms.get(roomCode);
-  if (room) {
-    room.players.delete(playerId);
-    broadcastRoom(room, {
-      type: 'player_left',
-      playerId
-    });
-
-    if (room.players.size === 0) {
-      rooms.delete(roomCode);
-    } else {
-      broadcastRoom(room, roomState(room));
-    }
+function joinRoom(ws, roomCode, name) {
+  let room = rooms.get(roomCode);
+  if (!room) {
+    safeSend(ws, { type: 'error', message: 'Room not found.' });
+    return;
   }
 
-  clients.delete(ws);
+  const client = clients.get(ws);
+  if (!client) return;
+
+  client.roomCode = roomCode;
+
+  const player = {
+    id: client.playerId,
+    name: (name || 'Player').slice(0, 16),
+    x: 100 + Math.random() * 600,
+    y: 100 + Math.random() * 300,
+    vx: 0,
+    vy: 0,
+    angle: 0,
+    hp: 100,
+    color: client.color
+  };
+
+  room.players.set(player.id, player);
+
+  safeSend(ws, {
+    type: 'joined',
+    playerId: player.id,
+    room: roomSnapshot(room)
+  });
+
+  broadcastRoom(roomCode, {
+    type: 'playerJoined',
+    player
+  }, ws);
 }
 
-const html = `<!DOCTYPE html>
+function leaveRoom(ws) {
+  const client = clients.get(ws);
+  if (!client || !client.roomCode) return;
+  const room = rooms.get(client.roomCode);
+  if (!room) return;
+
+  const playerId = client.playerId;
+  room.players.delete(playerId);
+
+  broadcastRoom(client.roomCode, {
+    type: 'playerLeft',
+    playerId
+  }, ws);
+
+  if (room.players.size === 0) {
+    rooms.delete(client.roomCode);
+  }
+
+  client.roomCode = null;
+}
+
+const html = String.raw`<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Wasmer Multiplayer Shooter</title>
-  <style>
-    :root {
-      --bg: #0A0A0B;
-      --panel: rgba(255,255,255,0.08);
-      --border: rgba(255,255,255,0.18);
-      --cyan: #00F5FF;
-      --magenta: #FF00E5;
-      --text: #F4F7FB;
-      --muted: #AAB3C5;
-      --danger: #ff4d6d;
-      --ok: #2bd576;
-    }
-
-    * { box-sizing: border-box; }
-    html, body {
-      margin: 0;
-      width: 100%;
-      height: 100%;
-      background: radial-gradient(circle at top, #15151a 0%, #0A0A0B 55%);
-      color: var(--text);
-      font-family: Inter, Arial, sans-serif;
-      overflow: hidden;
-    }
-
-    canvas {
-      display: block;
-      width: 100vw;
-      height: 100vh;
-      background: transparent;
-    }
-
-    .hud, .menu {
-      position: fixed;
-      z-index: 10;
-      backdrop-filter: blur(24px) saturate(180%);
-      -webkit-backdrop-filter: blur(24px) saturate(180%);
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      box-shadow: 0 10px 40px rgba(0,0,0,0.35);
-    }
-
-    .menu {
-      left: 50%;
-      top: 50%;
-      transform: translate(-50%, -50%);
-      width: min(92vw, 420px);
-      padding: 18px;
-    }
-
-    .hud {
-      top: 12px;
-      left: 12px;
-      padding: 12px 14px;
-      min-width: 250px;
-    }
-
-    h1, h2, p { margin: 0 0 12px 0; }
-    h1 {
-      font-size: 20px;
-      color: var(--cyan);
-    }
-
-    .row {
-      display: flex;
-      gap: 10px;
-      margin: 8px 0;
-      align-items: center;
-    }
-
-    .col {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-
-    input, button {
-      width: 100%;
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 12px 14px;
-      background: rgba(255,255,255,0.06);
-      color: var(--text);
-      outline: none;
-      font-size: 14px;
-    }
-
-    input::placeholder { color: #98a2b3; }
-
-    button {
-      cursor: pointer;
-      transition: 0.2s ease;
-      font-weight: 700;
-    }
-
-    button:hover {
-      transform: translateY(-1px);
-      border-color: rgba(0,245,255,0.5);
-      box-shadow: 0 0 18px rgba(0,245,255,0.18);
-    }
-
-    .primary {
-      background: linear-gradient(135deg, rgba(0,245,255,0.18), rgba(255,0,229,0.18));
-    }
-
-    .muted { color: var(--muted); font-size: 13px; }
-    .ok { color: var(--ok); }
-    .danger { color: var(--danger); }
-    .hidden { display: none; }
-
-    .badge {
-      display: inline-block;
-      padding: 6px 10px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      color: var(--cyan);
-      background: rgba(255,255,255,0.06);
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-    }
-
-    .topright {
-      position: fixed;
-      top: 12px;
-      right: 12px;
-      z-index: 11;
-      backdrop-filter: blur(24px) saturate(180%);
-      -webkit-backdrop-filter: blur(24px) saturate(180%);
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      padding: 10px 12px;
-      font-size: 13px;
-    }
-  </style>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0" />
+<title>Wasmer Multiplayer Shooter</title>
+<style>
+  :root{
+    --bg:#0A0A0B;
+    --panel:rgba(255,255,255,0.10);
+    --border:rgba(255,255,255,0.18);
+    --cyan:#00F5FF;
+    --magenta:#FF00E5;
+    --text:#F3F7FA;
+    --muted:#9FB0C0;
+    --danger:#ff5c7a;
+    --ok:#6cffb2;
+  }
+  *{box-sizing:border-box}
+  html,body{
+    margin:0;padding:0;width:100%;height:100%;
+    background:radial-gradient(circle at top, #141418 0%, #0A0A0B 60%);
+    color:var(--text);
+    font-family:Inter,system-ui,Arial,sans-serif;
+    overflow:hidden;
+  }
+  canvas{
+    display:block;
+    width:100vw;
+    height:100vh;
+    background:transparent;
+  }
+  .hud{
+    position:fixed;
+    top:14px;
+    left:14px;
+    right:14px;
+    display:flex;
+    justify-content:space-between;
+    align-items:flex-start;
+    gap:12px;
+    pointer-events:none;
+  }
+  .panel{
+    pointer-events:auto;
+    background:var(--panel);
+    border:1px solid var(--border);
+    backdrop-filter:blur(24px) saturate(180%);
+    -webkit-backdrop-filter:blur(24px) saturate(180%);
+    border-radius:16px;
+    padding:12px;
+    box-shadow:0 10px 35px rgba(0,0,0,0.35);
+  }
+  .leftPanel{
+    width:min(380px, calc(100vw - 28px));
+  }
+  .topInfo{
+    min-width:220px;
+    text-align:right;
+  }
+  h1{
+    margin:0 0 8px 0;
+    font-size:18px;
+    color:var(--cyan);
+    text-shadow:0 0 12px rgba(0,245,255,0.35);
+  }
+  .row{
+    display:flex;
+    gap:8px;
+    margin-top:8px;
+  }
+  input{
+    width:100%;
+    padding:10px 12px;
+    border-radius:10px;
+    border:1px solid var(--border);
+    background:rgba(255,255,255,0.08);
+    color:white;
+    outline:none;
+  }
+  input::placeholder{color:#b9c4cf}
+  button{
+    padding:10px 12px;
+    border:none;
+    border-radius:10px;
+    cursor:pointer;
+    font-weight:700;
+    color:#071014;
+    background:linear-gradient(135deg,var(--cyan),#7efaff);
+  }
+  button.alt{
+    background:linear-gradient(135deg,var(--magenta),#ff6bf1);
+    color:white;
+  }
+  .small{
+    font-size:12px;
+    color:var(--muted);
+    margin-top:8px;
+  }
+  .status{
+    margin-top:8px;
+    font-size:13px;
+  }
+  .ok{color:var(--ok)}
+  .err{color:var(--danger)}
+  .code{
+    font-weight:800;
+    letter-spacing:2px;
+    color:var(--cyan);
+    font-size:18px;
+  }
+  .help{
+    position:fixed;
+    left:14px;
+    bottom:14px;
+    max-width:min(420px, calc(100vw - 28px));
+    font-size:12px;
+    color:var(--muted);
+  }
+  .badge{
+    display:inline-block;
+    margin-top:6px;
+    padding:6px 10px;
+    border-radius:999px;
+    border:1px solid rgba(0,245,255,.25);
+    background:rgba(0,245,255,.08);
+    color:var(--cyan);
+    font-size:12px;
+  }
+</style>
 </head>
 <body>
   <canvas id="game"></canvas>
 
-  <div class="menu" id="menu">
-    <h1>Multiplayer Shooter</h1>
-    <p class="muted">Create a room or join one with a code. Open in two tabs to test.</p>
-
-    <div class="col">
-      <input id="nameInput" maxlength="16" placeholder="Your name" />
+  <div class="hud">
+    <div class="panel leftPanel">
+      <h1>Multiplayer Shooter</h1>
+      <input id="nameInput" placeholder="Your name" maxlength="16" />
       <div class="row">
-        <button class="primary" id="createBtn">Create Room</button>
-        <button id="joinBtn">Join Room</button>
+        <button id="createBtn">Create Room</button>
       </div>
-      <input id="roomInput" maxlength="6" placeholder="Room code (for Join)" />
-      <p id="status" class="muted">Connecting...</p>
+      <div class="row">
+        <input id="roomInput" placeholder="Enter room code" maxlength="6" />
+        <button id="joinBtn" class="alt">Join Room</button>
+      </div>
+      <div id="status" class="status">Connecting...</div>
+      <div class="small">Open this in another tab/device and join the same room code.</div>
+    </div>
+
+    <div class="panel topInfo">
+      <div>Room</div>
+      <div id="roomCode" class="code">------</div>
+      <div id="playersCount" class="small">Players: 0</div>
+      <div id="share" class="badge" style="display:none;"></div>
     </div>
   </div>
 
-  <div class="hud hidden" id="hud">
-    <div class="row" style="justify-content:space-between;">
-      <strong>Room: <span id="roomCode">------</span></strong>
-      <span class="badge" id="hpLabel">HP 100</span>
-    </div>
-    <div class="muted">WASD move · Mouse aim · Click shoot</div>
-    <div class="muted">Share this code with friends.</div>
+  <div class="panel help">
+    Move: <b>WASD / Arrow keys</b> · Aim: <b>Mouse</b> · Shoot: <b>Click</b>
   </div>
 
-  <div class="topright hidden" id="netBox">offline</div>
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
 
-  <script>
-    const canvas = document.getElementById('game');
-    const ctx = canvas.getContext('2d');
+  const nameInput = document.getElementById('nameInput');
+  const roomInput = document.getElementById('roomInput');
+  const createBtn = document.getElementById('createBtn');
+  const joinBtn = document.getElementById('joinBtn');
+  const statusEl = document.getElementById('status');
+  const roomCodeEl = document.getElementById('roomCode');
+  const playersCountEl = document.getElementById('playersCount');
+  const shareEl = document.getElementById('share');
 
-    const menu = document.getElementById('menu');
-    const hud = document.getElementById('hud');
-    const roomCodeEl = document.getElementById('roomCode');
-    const hpLabel = document.getElementById('hpLabel');
-    const statusEl = document.getElementById('status');
-    const netBox = document.getElementById('netBox');
+  let W = canvas.width = window.innerWidth;
+  let H = canvas.height = window.innerHeight;
 
-    const nameInput = document.getElementById('nameInput');
-    const roomInput = document.getElementById('roomInput');
-    const createBtn = document.getElementById('createBtn');
-    const joinBtn = document.getElementById('joinBtn');
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(proto + '//' + location.host + '/ws');
 
-    let W = canvas.width = innerWidth;
-    let H = canvas.height = innerHeight;
-    addEventListener('resize', () => {
-      W = canvas.width = innerWidth;
-      H = canvas.height = innerHeight;
-    });
+  let connected = false;
+  let myId = null;
+  let currentRoom = null;
+  let mouse = { x: W/2, y: H/2, down: false };
+  let keys = new Set();
+  let lastSent = 0;
+  let lastShot = 0;
 
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(proto + '//' + location.host + '/ws');
+  const state = {
+    players: new Map(),
+    bullets: []
+  };
 
-    const state = {
-      connected: false,
-      joined: false,
-      selfId: null,
-      roomCode: null,
-      players: new Map(),
-      bullets: [],
-      keys: {},
-      mouse: { x: W/2, y: H/2 },
-      me: { x: 200, y: 200, angle: 0, hp: 100, color: '#00F5FF', name: 'Player' },
-      lastSent: 0
-    };
+  const me = () => state.players.get(myId);
 
-    function setStatus(msg, cls='muted') {
-      statusEl.className = cls;
-      statusEl.textContent = msg;
+  function setStatus(msg, ok = true) {
+    statusEl.textContent = msg;
+    statusEl.className = 'status ' + (ok ? 'ok' : 'err');
+  }
+
+  function resize() {
+    W = canvas.width = window.innerWidth;
+    H = canvas.height = window.innerHeight;
+  }
+  window.addEventListener('resize', resize);
+
+  function randomFallbackColor(id) {
+    const colors = ['#00F5FF','#FF00E5','#6CFFB2','#FFD166','#7AA2FF'];
+    let sum = 0;
+    for (let i = 0; i < id.length; i++) sum += id.charCodeAt(i);
+    return colors[sum % colors.length];
+  }
+
+  function updateUi() {
+    roomCodeEl.textContent = currentRoom || '------';
+    playersCountEl.textContent = 'Players: ' + state.players.size;
+    if (currentRoom) {
+      shareEl.style.display = 'inline-block';
+      shareEl.textContent = 'Share code: ' + currentRoom;
+    } else {
+      shareEl.style.display = 'none';
+    }
+  }
+
+  ws.addEventListener('open', () => {
+    connected = true;
+    setStatus('Connected to server');
+  });
+
+  ws.addEventListener('close', () => {
+    connected = false;
+    setStatus('Disconnected from server', false);
+  });
+
+  ws.addEventListener('error', () => {
+    setStatus('WebSocket error', false);
+  });
+
+  ws.addEventListener('message', (event) => {
+    const msg = JSON.parse(event.data);
+
+    if (msg.type === 'welcome') {
+      myId = msg.playerId;
+      setStatus('Connected. Create or join a room.');
     }
 
-    function randColor() {
-      const colors = ['#00F5FF', '#FF00E5', '#7CFF6B', '#FFD166', '#7AA2FF'];
-      return colors[Math.floor(Math.random() * colors.length)];
+    if (msg.type === 'roomCreated') {
+      currentRoom = msg.roomCode;
+      roomInput.value = msg.roomCode;
+      ws.send(JSON.stringify({
+        type: 'joinRoom',
+        roomCode: msg.roomCode,
+        name: nameInput.value.trim() || 'Player'
+      }));
+      updateUi();
     }
 
-    function send(obj) {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(obj));
-      }
+    if (msg.type === 'joined') {
+      currentRoom = msg.room.roomCode;
+      state.players.clear();
+      for (const p of msg.room.players) state.players.set(p.id, p);
+      state.bullets = msg.room.bullets || [];
+      updateUi();
+      setStatus('Joined room ' + currentRoom);
     }
 
-    ws.addEventListener('open', () => {
-      state.connected = true;
-      netBox.classList.remove('hidden');
-      netBox.textContent = 'online';
-      netBox.className = 'topright ok';
-      setStatus('Connected. Create or join a room.', 'ok');
-    });
+    if (msg.type === 'playerJoined') {
+      state.players.set(msg.player.id, msg.player);
+      updateUi();
+    }
 
-    ws.addEventListener('close', () => {
-      state.connected = false;
-      netBox.textContent = 'offline';
-      netBox.className = 'topright danger';
-      setStatus('Disconnected from server.', 'danger');
-    });
+    if (msg.type === 'playerLeft') {
+      state.players.delete(msg.playerId);
+      updateUi();
+    }
 
-    ws.addEventListener('message', (ev) => {
-      const msg = JSON.parse(ev.data);
-
-      if (msg.type === 'welcome') {
-        state.selfId = msg.playerId;
-      }
-
-      if (msg.type === 'joined') {
-        state.joined = true;
-        state.roomCode = msg.roomCode;
-        roomCodeEl.textContent = msg.roomCode;
-        menu.classList.add('hidden');
-        hud.classList.remove('hidden');
-        history.replaceState(null, '', '/?room=' + encodeURIComponent(msg.roomCode));
-      }
-
-      if (msg.type === 'state') {
-        state.players.clear();
+    if (msg.type === 'state') {
+      if (msg.players) {
         for (const p of msg.players) {
-          state.players.set(p.id, p);
-          if (p.id === state.selfId) {
-            state.me.hp = p.hp;
-            hpLabel.textContent = 'HP ' + p.hp;
-          }
+          const existing = state.players.get(p.id) || {};
+          state.players.set(p.id, { ...existing, ...p });
         }
-        state.bullets = msg.bullets || [];
       }
-
-      if (msg.type === 'error') {
-        setStatus(msg.message || 'Error', 'danger');
-      }
-    });
-
-    createBtn.onclick = () => {
-      const name = (nameInput.value || 'Player').trim().slice(0,16);
-      state.me.name = name || 'Player';
-      state.me.color = randColor();
-      send({
-        type: 'create_room',
-        name: state.me.name,
-        color: state.me.color
-      });
-    };
-
-    joinBtn.onclick = () => {
-      const code = (roomInput.value || '').trim().toUpperCase();
-      const name = (nameInput.value || 'Player').trim().slice(0,16);
-      if (!code) {
-        setStatus('Enter a room code first.', 'danger');
-        return;
-      }
-      state.me.name = name || 'Player';
-      state.me.color = randColor();
-      send({
-        type: 'join_room',
-        roomCode: code,
-        name: state.me.name,
-        color: state.me.color
-      });
-    };
-
-    const params = new URLSearchParams(location.search);
-    const roomFromUrl = (params.get('room') || '').toUpperCase();
-    if (roomFromUrl) roomInput.value = roomFromUrl;
-
-    addEventListener('keydown', e => state.keys[e.key.toLowerCase()] = true);
-    addEventListener('keyup', e => state.keys[e.key.toLowerCase()] = false);
-    addEventListener('mousemove', e => {
-      state.mouse.x = e.clientX;
-      state.mouse.y = e.clientY;
-    });
-
-    addEventListener('mousedown', () => {
-      if (!state.joined) return;
-      send({ type: 'shoot' });
-    });
-
-    function update(dt) {
-      if (!state.joined) return;
-
-      const speed = 220;
-      let dx = 0, dy = 0;
-      if (state.keys['w']) dy -= 1;
-      if (state.keys['s']) dy += 1;
-      if (state.keys['a']) dx -= 1;
-      if (state.keys['d']) dx += 1;
-
-      const len = Math.hypot(dx, dy) || 1;
-      dx /= len; dy /= len;
-
-      state.me.x += dx * speed * dt;
-      state.me.y += dy * speed * dt;
-
-      state.me.x = Math.max(20, Math.min(W - 20, state.me.x));
-      state.me.y = Math.max(20, Math.min(H - 20, state.me.y));
-
-      state.me.angle = Math.atan2(state.mouse.y - state.me.y, state.mouse.x - state.me.x);
-
-      const now = performance.now();
-      if (now - state.lastSent > 33) {
-        state.lastSent = now;
-        send({
-          type: 'move',
-          x: state.me.x,
-          y: state.me.y,
-          angle: state.me.angle
-        });
-      }
+      if (msg.bullets) state.bullets = msg.bullets;
+      updateUi();
     }
 
-    function drawGrid() {
-      ctx.strokeStyle = 'rgba(255,255,255,0.05)';
-      ctx.lineWidth = 1;
-      const size = 40;
-      for (let x = 0; x < W; x += size) {
-        ctx.beginPath();
-        ctx.moveTo(x, 0);
-        ctx.lineTo(x, H);
-        ctx.stroke();
-      }
-      for (let y = 0; y < H; y += size) {
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(W, y);
-        ctx.stroke();
-      }
+    if (msg.type === 'error') {
+      setStatus(msg.message || 'Server error', false);
+    }
+  });
+
+  createBtn.addEventListener('click', () => {
+    if (!connected) return setStatus('Not connected yet', false);
+    ws.send(JSON.stringify({ type: 'createRoom' }));
+  });
+
+  joinBtn.addEventListener('click', () => {
+    if (!connected) return setStatus('Not connected yet', false);
+    const code = roomInput.value.trim().toUpperCase();
+    if (!code) return setStatus('Enter a room code', false);
+    ws.send(JSON.stringify({
+      type: 'joinRoom',
+      roomCode: code,
+      name: nameInput.value.trim() || 'Player'
+    }));
+  });
+
+  window.addEventListener('keydown', e => keys.add(e.key.toLowerCase()));
+  window.addEventListener('keyup', e => keys.delete(e.key.toLowerCase()));
+  window.addEventListener('mousemove', e => {
+    mouse.x = e.clientX;
+    mouse.y = e.clientY;
+  });
+  window.addEventListener('mousedown', () => mouse.down = true);
+  window.addEventListener('mouseup', () => mouse.down = false);
+
+  function updateLocal(dt) {
+    const p = me();
+    if (!p) return;
+
+    let dx = 0, dy = 0;
+    if (keys.has('w') || keys.has('arrowup')) dy -= 1;
+    if (keys.has('s') || keys.has('arrowdown')) dy += 1;
+    if (keys.has('a') || keys.has('arrowleft')) dx -= 1;
+    if (keys.has('d') || keys.has('arrowright')) dx += 1;
+
+    const len = Math.hypot(dx, dy) || 1;
+    dx /= len; dy /= len;
+
+    const speed = 220;
+    p.x += dx * speed * dt;
+    p.y += dy * speed * dt;
+
+    p.x = Math.max(20, Math.min(W - 20, p.x));
+    p.y = Math.max(20, Math.min(H - 20, p.y));
+
+    p.angle = Math.atan2(mouse.y - p.y, mouse.x - p.x);
+
+    const now = performance.now();
+    if (ws.readyState === 1 && now - lastSent > 33) {
+      ws.send(JSON.stringify({
+        type: 'move',
+        x: p.x,
+        y: p.y,
+        angle: p.angle
+      }));
+      lastSent = now;
     }
 
-    function drawPlayer(p, isSelf) {
+    if (mouse.down && ws.readyState === 1 && now - lastShot > 160) {
+      ws.send(JSON.stringify({
+        type: 'shoot',
+        x: p.x,
+        y: p.y,
+        angle: p.angle
+      }));
+      lastShot = now;
+    }
+  }
+
+  function drawGrid() {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 1;
+    for (let x = 0; x < W; x += 40) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, H);
+      ctx.stroke();
+    }
+    for (let y = 0; y < H; y += 40) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(W, y);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawPlayer(p, isMe) {
+    const color = p.color || randomFallbackColor(p.id);
+
+    ctx.save();
+    ctx.translate(p.x, p.y);
+
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 18;
+
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(0, 0, 14, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.rotate(p.angle || 0);
+    ctx.fillStyle = '#dffcff';
+    ctx.fillRect(6, -4, 18, 8);
+
+    ctx.restore();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '12px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText((isMe ? 'You' : p.name || 'Player') + ' [' + (p.hp ?? 100) + ']', p.x, p.y - 22);
+  }
+
+  function drawBullets() {
+    for (const b of state.bullets) {
       ctx.save();
-      ctx.translate(p.x, p.y);
-      ctx.rotate(p.angle || 0);
-
-      ctx.shadowBlur = 18;
-      ctx.shadowColor = p.color || '#00F5FF';
-      ctx.fillStyle = p.color || '#00F5FF';
-
-      ctx.fillRect(-10, -10, 20, 20);
-      ctx.fillRect(8, -3, 16, 6);
-
-      ctx.restore();
-
-      ctx.fillStyle = '#fff';
-      ctx.font = '12px Arial';
-      ctx.textAlign = 'center';
-      ctx.fillText((p.name || 'Player') + (isSelf ? ' (You)' : ''), p.x, p.y - 18);
-
-      ctx.fillStyle = 'rgba(255,255,255,0.15)';
-      ctx.fillRect(p.x - 20, p.y + 16, 40, 5);
-      ctx.fillStyle = p.hp > 35 ? '#2bd576' : '#ff4d6d';
-      ctx.fillRect(p.x - 20, p.y + 16, Math.max(0, (p.hp / 100) * 40), 5);
-    }
-
-    function drawBullet(b) {
+      ctx.fillStyle = '#FFD166';
+      ctx.shadowColor = '#FFD166';
+      ctx.shadowBlur = 10;
       ctx.beginPath();
       ctx.arc(b.x, b.y, 4, 0, Math.PI * 2);
-      ctx.fillStyle = '#FF00E5';
-      ctx.shadowBlur = 12;
-      ctx.shadowColor = '#FF00E5';
       ctx.fill();
-      ctx.shadowBlur = 0;
+      ctx.restore();
+    }
+  }
+
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+
+    updateLocal(dt);
+
+    ctx.clearRect(0, 0, W, H);
+
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#101218');
+    g.addColorStop(1, '#09090b');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    drawGrid();
+    drawBullets();
+
+    for (const [id, p] of state.players) {
+      drawPlayer(p, id === myId);
     }
 
-    let last = performance.now();
-    function loop(now) {
-      const dt = Math.min(0.033, (now - last) / 1000);
-      last = now;
-
-      update(dt);
-
-      ctx.clearRect(0, 0, W, H);
-      drawGrid();
-
-      for (const b of state.bullets) drawBullet(b);
-      for (const [id, p] of state.players) drawPlayer(p, id === state.selfId);
-
-      requestAnimationFrame(loop);
-    }
     requestAnimationFrame(loop);
-  </script>
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
 </body>
 </html>`;
 
 const server = http.createServer((req, res) => {
-  if (req.url === '/' || req.url.startsWith('/?')) {
+  if (req.url === '/' || req.url === '/index.html') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(html);
     return;
   }
 
   if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ ok: true }));
     return;
   }
@@ -548,150 +604,125 @@ server.on('upgrade', (req, socket, head) => {
 
 wss.on('connection', (ws) => {
   const playerId = makeId();
+  const colorOptions = ['#00F5FF', '#FF00E5', '#6CFFB2', '#FFD166', '#7AA2FF'];
+  const color = colorOptions[Math.floor(Math.random() * colorOptions.length)];
 
-  ws.send(JSON.stringify({
-    type: 'welcome',
-    playerId
-  }));
+  clients.set(ws, {
+    ws,
+    playerId,
+    roomCode: null,
+    color
+  });
+
+  safeSend(ws, { type: 'welcome', playerId });
 
   ws.on('message', (raw) => {
     let msg;
     try {
-      msg = JSON.parse(raw.toString());
+      msg = JSON.parse(String(raw));
     } catch {
       return;
     }
 
-    if (msg.type === 'create_room') {
-      let code;
-      do {
-        code = makeRoomCode();
-      } while (rooms.has(code));
+    const client = clients.get(ws);
+    if (!client) return;
 
-      const room = getOrCreateRoom(code);
-      const player = {
-        id: playerId,
-        ws,
-        name: (msg.name || 'Player').slice(0, 16),
-        x: 200 + Math.random() * 300,
-        y: 150 + Math.random() * 200,
-        angle: 0,
-        hp: 100,
-        color: msg.color || '#00F5FF'
-      };
-
-      room.players.set(playerId, player);
-      clients.set(ws, { roomCode: code, playerId });
-
-      ws.send(JSON.stringify({ type: 'joined', roomCode: code, playerId }));
-      broadcastRoom(room, roomState(room));
+    if (msg.type === 'createRoom') {
+      const room = createRoom();
+      safeSend(ws, { type: 'roomCreated', roomCode: room.code });
       return;
     }
 
-    if (msg.type === 'join_room') {
-      const code = String(msg.roomCode || '').toUpperCase();
-      const room = rooms.get(code);
-
-      if (!room) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Room not found.' }));
-        return;
-      }
-
-      const player = {
-        id: playerId,
-        ws,
-        name: (msg.name || 'Player').slice(0, 16),
-        x: 240 + Math.random() * 260,
-        y: 170 + Math.random() * 180,
-        angle: 0,
-        hp: 100,
-        color: msg.color || '#FF00E5'
-      };
-
-      room.players.set(playerId, player);
-      clients.set(ws, { roomCode: code, playerId });
-
-      ws.send(JSON.stringify({ type: 'joined', roomCode: code, playerId }));
-      broadcastRoom(room, roomState(room));
+    if (msg.type === 'joinRoom') {
+      leaveRoom(ws);
+      joinRoom(ws, String(msg.roomCode || '').toUpperCase(), String(msg.name || 'Player'));
       return;
     }
 
-    const meta = clients.get(ws);
-    if (!meta) return;
-
-    const room = rooms.get(meta.roomCode);
+    if (!client.roomCode) return;
+    const room = rooms.get(client.roomCode);
     if (!room) return;
-
-    const player = room.players.get(meta.playerId);
+    const player = room.players.get(client.playerId);
     if (!player) return;
 
     if (msg.type === 'move') {
-      player.x = Math.max(20, Math.min(3000, Number(msg.x) || player.x));
-      player.y = Math.max(20, Math.min(3000, Number(msg.y) || player.y));
+      player.x = Number(msg.x) || player.x;
+      player.y = Number(msg.y) || player.y;
       player.angle = Number(msg.angle) || 0;
-      broadcastRoom(room, roomState(room));
+
+      broadcastRoom(client.roomCode, {
+        type: 'state',
+        players: [player]
+      }, ws);
       return;
     }
 
     if (msg.type === 'shoot') {
-      const speed = 560;
+      const speed = 500;
       const bullet = {
         id: room.lastBulletId++,
         ownerId: player.id,
-        x: player.x + Math.cos(player.angle) * 24,
-        y: player.y + Math.sin(player.angle) * 24,
+        x: player.x + Math.cos(player.angle) * 22,
+        y: player.y + Math.sin(player.angle) * 22,
         vx: Math.cos(player.angle) * speed,
         vy: Math.sin(player.angle) * speed,
-        ttl: 1.1
+        life: 1.2
       };
       room.bullets.push(bullet);
-      broadcastRoom(room, roomState(room));
+      broadcastRoom(client.roomCode, {
+        type: 'state',
+        bullets: room.bullets
+      });
       return;
     }
   });
 
-  ws.on('close', () => removePlayer(ws));
-  ws.on('error', () => removePlayer(ws));
+  ws.on('close', () => {
+    leaveRoom(ws);
+    clients.delete(ws);
+  });
 });
 
 setInterval(() => {
   for (const room of rooms.values()) {
-    const survivors = [];
+    for (let i = room.bullets.length - 1; i >= 0; i--) {
+      const b = room.bullets[i];
+      b.x += b.vx / 30;
+      b.y += b.vy / 30;
+      b.life -= 1 / 30;
 
-    for (const b of room.bullets) {
-      b.x += b.vx * 0.05;
-      b.y += b.vy * 0.05;
-      b.ttl -= 0.05;
+      if (b.life <= 0) {
+        room.bullets.splice(i, 1);
+        continue;
+      }
 
-      let hit = false;
       for (const p of room.players.values()) {
         if (p.id === b.ownerId) continue;
         const dx = p.x - b.x;
         const dy = p.y - b.y;
-        if ((dx * dx + dy * dy) < 18 * 18) {
+        if (dx * dx + dy * dy < 18 * 18) {
           p.hp -= 20;
           if (p.hp <= 0) {
             p.hp = 100;
-            p.x = 120 + Math.random() * 500;
-            p.y = 120 + Math.random() * 300;
+            p.x = 80 + Math.random() * 700;
+            p.y = 80 + Math.random() * 400;
           }
-          hit = true;
+          room.bullets.splice(i, 1);
           break;
         }
       }
-
-      if (!hit && b.ttl > 0) survivors.push(b);
     }
 
-    room.bullets = survivors;
-    if (room.players.size > 0) {
-      broadcastRoom(room, roomState(room));
-    }
+    broadcastRoom(room.code, {
+      type: 'state',
+      players: Array.from(room.players.values()),
+      bullets: room.bullets
+    });
   }
-}, 50);
+}, 1000 / 30);
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('Server listening on port ' + PORT);
+  console.log('Server running on port', PORT);
 });
 EOF
 
